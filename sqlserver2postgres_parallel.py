@@ -1,8 +1,11 @@
+# Processes 2 tables at a time. This has 2 threads
+
 import os
 import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 import concurrent.futures
+from typing import List, Optional
 
 def create_connection():
     pwd = os.environ['PGPASS']
@@ -15,7 +18,7 @@ def create_connection():
     connection_url = URL.create("mssql+pyodbc", query={"odbc_connect": connection_string})
     return create_engine(connection_url)
 
-def load_table(table_name, src_engine, dest_engine):
+def load_table(table_name: str, src_engine, dest_engine):
     try:
         # Connect to source and load table
         with src_engine.connect() as src_conn:
@@ -31,7 +34,7 @@ def load_table(table_name, src_engine, dest_engine):
         print(f"Error importing {table_name}: {str(e)}")
         return None
 
-def extract_and_load_parallelly():
+def extract_and_load_parallelly(parallel_threads: Optional[int] = None):
     try:
         # Create source and destination engines
         src_engine = create_connection()
@@ -47,16 +50,25 @@ def extract_and_load_parallelly():
             """
             src_tables = pd.read_sql_query(query, src_conn)['table_name'].tolist()
         
-        # Parallel processing of tables
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(src_tables))) as executor:
-            # Create a future for each table
-            futures = {
-                executor.submit(load_table, table, src_engine, dest_engine): table 
-                for table in src_tables
-            }
+        # Determine number of parallel threads
+        if parallel_threads is None:
+            parallel_threads = min(6, len(src_tables))
+        
+        # Process tables in batches
+        for i in range(0, len(src_tables), parallel_threads):
+            batch = src_tables[i:i+parallel_threads] #gets 2 tables at a time from the list, starting from first if paralle_threads=2. then moves on to next 2
             
-            # Wait for all futures to complete
-            concurrent.futures.wait(futures)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                # Create a future for each table in the batch
+                futures = {
+                    executor.submit(load_table, table, src_engine, dest_engine): table 
+                    for table in batch
+                }
+                
+                # Wait for all futures in the batch to complete
+                concurrent.futures.wait(futures)
+            
+            print(f"Completed batch {i//parallel_threads + 1}")
         
         print("All tables imported successfully")
     
@@ -65,4 +77,9 @@ def extract_and_load_parallelly():
 
 # Run the parallel extraction and loading
 if __name__ == '__main__':
-    extract_and_load_parallelly()
+    # Example usage with different thread configurations
+    # Process 2 tables at a time
+    extract_and_load_parallelly(parallel_threads=2)
+    
+    # Or let it use default (max 6 threads)
+    # extract_and_load_parallelly()
