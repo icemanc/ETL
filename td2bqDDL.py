@@ -3,10 +3,11 @@ import re
 def convert_ddl_to_bigquery_sql(ddl):
     ddl = ddl.strip()
 
-    # Type mappings
+    # Type mappings. this will only cast columns in source sql output
     source_type_mapping = {
         'time(0)': 'varchar(40)',
         'DECIMAL(*,*)': 'STRING',
+        'NUMERIC(*,*)': 'STRING',
         'BYTEINT': 'STRING',
         'VARCHAR(*)': 'STRING',
         'CHAR(*)': 'STRING'
@@ -15,6 +16,7 @@ def convert_ddl_to_bigquery_sql(ddl):
     stage_type_mapping = {
         'SMALLINT': 'STRING',
         'DECIMAL(*,*)': 'STRING',
+        'NUMERIC(*,*)': 'numeric(*,*)',
         'BYTEINT': 'STRING',
         'INTEGER': 'STRING',
         'DATE': 'DATE',
@@ -27,6 +29,7 @@ def convert_ddl_to_bigquery_sql(ddl):
     target_type_mapping = {
         'SMALLINT': 'INT64',
         'DECIMAL(*,*)': 'NUMERIC(*,*)',
+        'NUMERIC(*,*)': 'NUMERIC(*,*)',
         'BYTEINT': 'INT64',
         'INTEGER': 'INT64',
         'DATE': 'DATE',
@@ -37,11 +40,13 @@ def convert_ddl_to_bigquery_sql(ddl):
     }
 
     def resolve_type(teradata_type, mapping):
-        decimal_match = re.match(r'DECIMAL\((\d+),\s*(\d+)\)', teradata_type, re.IGNORECASE)
-        if decimal_match:
-            precision, scale = decimal_match.groups()
-            if 'DECIMAL(*,*)' in mapping:
-                return mapping['DECIMAL(*,*)'].replace('*', precision, 1).replace('*', scale, 1)
+        # Match DECIMAL(p,s) or NUMERIC(p,s)
+        numeric_match = re.match(r'(DECIMAL|NUMERIC)\((\d+),\s*(\d+)\)', teradata_type, re.IGNORECASE)
+        if numeric_match:
+            base_type, precision, scale = numeric_match.groups()
+            key = f'{base_type.upper()}(*,*)'
+            if key in mapping:
+                return mapping[key].replace('*', precision, 1).replace('*', scale, 1)
             return mapping.get(teradata_type, 'STRING')
 
         if teradata_type.startswith('VARCHAR'):
@@ -51,11 +56,13 @@ def convert_ddl_to_bigquery_sql(ddl):
 
         return mapping.get(teradata_type, 'STRING')
 
+    # Extract table name
     table_match = re.search(r'TABLE\s+([\w\.]+)', ddl, re.IGNORECASE)
     if not table_match:
         raise ValueError("Table name not found in DDL")
     table_name = table_match.group(1)
 
+    # Extract column definitions
     start_idx = ddl.find('(')
     end_idx = ddl.rfind(')')
     if start_idx == -1 or end_idx == -1:
@@ -64,6 +71,7 @@ def convert_ddl_to_bigquery_sql(ddl):
 
     column_text = ' '.join(line.strip() for line in column_section.split('\n') if line.strip())
 
+    # Smart column splitting
     columns_raw = []
     current = ""
     paren_level = 0
@@ -82,6 +90,7 @@ def convert_ddl_to_bigquery_sql(ddl):
     if current.strip():
         columns_raw.append(current.strip())
 
+    # Filter out non-column lines
     columns = [col for col in columns_raw if not col.upper().startswith(('PRIMARY', 'PARTITION', 'INDEX'))]
 
     column_defs = []
@@ -110,25 +119,29 @@ def convert_ddl_to_bigquery_sql(ddl):
         target_type = resolve_type(teradata_type, target_type_mapping)
         source_type = resolve_type(teradata_type, source_type_mapping)
 
-        stage_columns.append(f"  {col_name} {stage_type}")
-        target_columns.append(f"  {col_name} {target_type}")
+        stage_columns.append(f"{col_name} {stage_type}")
+        target_columns.append(f"{col_name} {target_type}")
 
         if stage_type != target_type:
-            insert_select_columns.append(f"  CAST({col_name} AS {target_type}) AS {col_name}")
+            insert_select_columns.append(f"CAST({col_name} AS {target_type}) AS {col_name}")
         else:
-            insert_select_columns.append(f"  {col_name}")
+            insert_select_columns.append(f"{col_name}")
 
         if source_type:
-            source_select_columns.append(f"  CAST({col_name} AS {source_type}) AS {col_name}")
+            source_select_columns.append(f"CAST({col_name} AS {source_type}) AS {col_name}")
         else:
-            source_select_columns.append(f"  {col_name}")
+            source_select_columns.append(f"{col_name}")
 
+    def format_with_leading_commas(items):
+        return "\n  " + "\n  , ".join(items)
+
+    # Generate SQL strings
     source_sql = (
         "===================="
         "\n*    SOURCE SQL    *"
         "\n===================="
-        "\nSELECT\n" +
-        ",\n".join(source_select_columns) +
+        "\nSELECT" +
+        format_with_leading_commas(source_select_columns) +
         f"\nFROM {table_name};"
     )
 
@@ -136,8 +149,8 @@ def convert_ddl_to_bigquery_sql(ddl):
         "===================="
         "\n-   STAGE TABLE   -"
         "\n===================="
-        f"\nCREATE TABLE {table_name}_stg (\n" +
-        ",\n".join(stage_columns) +
+        f"\nCREATE TABLE {table_name}_stg (" +
+        format_with_leading_commas(stage_columns) +
         "\n);"
     )
 
@@ -145,8 +158,8 @@ def convert_ddl_to_bigquery_sql(ddl):
         "===================="
         "\n-  TARGET TABLE   -"
         "\n===================="
-        f"\nCREATE TABLE {table_name} (\n" +
-        ",\n".join(target_columns) +
+        f"\nCREATE TABLE {table_name} (" +
+        format_with_leading_commas(target_columns) +
         "\n);"
     )
 
@@ -154,31 +167,29 @@ def convert_ddl_to_bigquery_sql(ddl):
         "===================="
         "\n- TRANSFORMATION  -"
         "\n===================="
-        f"\nINSERT INTO {table_name} (\n" +
-        ",\n".join(f"  {col_name.replace(' ', '_')}" for col_name, _ in column_defs) +
-        "\n)\nSELECT\n" +
-        ",\n".join(insert_select_columns) +
+        f"\nINSERT INTO {table_name} (" +
+        format_with_leading_commas([col_name.replace(' ', '_') for col_name, _ in column_defs]) +
+        "\n)\nSELECT" +
+        format_with_leading_commas(insert_select_columns) +
         f"\nFROM {table_name}_stg;"
     )
 
     return f"{source_sql}\n\n{stage_table_sql}\n\n{target_table_sql}\n\n{insert_sql}"
 
 
-# ✅ Example DDL input
+# ✅ Example DDL
 ddl = """
-CREATE MULTISET TABLE mydb.employee (
-    emp_id INTEGER,
-    emp_name VARCHAR(100),
-    salary DECIMAL(7,2),
-    work_hours DECIMAL(5,3),
-    hire_date DATE,
-    nickname CHAR(20),
-    timestamp_col TIMESTAMP(6)
+CREATE MULTISET TABLE finance.transactions (
+    txn_id INTEGER,
+    account_id INTEGER,
+    amount DECIMAL(10,2),
+    tax NUMERIC(5,3),
+    created_at TIMESTAMP(6),
+    txn_type VARCHAR(20),
+    remarks CHAR(100)
 );
 """
 
-# Run the conversion
+# Run the function
 result = convert_ddl_to_bigquery_sql(ddl)
-
-# Print the output
 print(result)
