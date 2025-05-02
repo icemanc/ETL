@@ -1,156 +1,105 @@
 import multiprocessing
 import time
-import os
-import threading
+from queue import Empty
 
-def task_function(number):
-    """Calculate the cube of a number. For demonstration purposes,
-    some calculations will artificially take longer than the timeout."""
-    pid = os.getpid()
-    print(f"Processing number {number} with PID {pid}")
-    
-    # Some numbers will artificially cause a delay to demonstrate timeout
-    if number % 5 == 0:
-        sleep_time = 70  # Will trigger timeout
-    else:
-        sleep_time = 10  # Will complete normally
-    
-    try:
-        print(f"Calculating cube of {number} (PID {pid}), will take {sleep_time} seconds")
-        # Artificial delay to demonstrate timeout
-        time.sleep(sleep_time)
-        
-        # Actual calculation
-        result = number ** 3
-        
-        print(f"Cube of {number} (PID {pid}) calculated: {result}")
-        return result
-    except Exception as e:
-        print(f"Calculation for {number} (PID {pid}) encountered an error: {str(e)}")
-        raise
+MAX_CONCURRENT = 3  # Maximum parallel processes
+TIMEOUT = 300       # Process timeout in seconds (5 minutes)
+CHECK_INTERVAL = 60 # Status check interval in seconds
 
-def process_number(number, result_queue):
-    """Worker function to process a number and put the result in a queue"""
-    try:
-        result = task_function(number)
-        result_queue.put((number, result))
-    except Exception as e:
-        result_queue.put((number, f"Error: {str(e)}"))
+def cube(number):
+    """Calculate cube of a number with simulated processing time"""
+    print(f"Processing {number}³ (PID: {multiprocessing.current_process().pid})")
+    time.sleep(number)  # Simulate processing time
+    result = number ** 3
+    return (number, result)
 
-def monitor_timeouts(process_data, timeout, results):
-    """Thread function to monitor processes for timeouts every 10 seconds"""
-    while True:
-        # Sleep for 10 seconds
-        time.sleep(10)
-        
-        # If no processes to monitor, exit the thread
-        if not process_data:
-            break
-            
-        print(f"Checking for timeouts... ({len(process_data)} active processes)")
-        
-        # Check each process for timeout
-        current_time = time.time()
-        for i in range(len(process_data) - 1, -1, -1):
-            if i < len(process_data):  # Protect against list changes during iteration
-                proc = process_data[i]
-                if not proc["process"].is_alive():
-                    # Process completed naturally
-                    process_data.pop(i)
-                    continue
-                    
-                elapsed_time = current_time - proc["start_time"]
-                if elapsed_time > timeout:
-                    number = proc["number"]
-                    pid = proc["pid"]
-                    print(f"PID {pid} task for number {number} is killed due to timeout (exceeded {timeout} seconds)")
-                    
-                    # Terminate the process
-                    proc["process"].terminate()
-                    results[number] = f"Timeout after {timeout} seconds"
-                    
-                    # Remove from active processes
-                    process_data.pop(i)
-
-def main():
-    """Main function using a separate thread for timeout checking"""
-    # List of numbers to process
-    numbers = [3, 7, 10, 15, 8, 20, 5, 12, 25, 9, 11, 30]
+if __name__ == '__main__':
+    # Input numbers to process
+    numbers = [2, 5, 30, 10, 80, 4, 15, 20, 7]
+    results = []
     
-    # Maximum concurrent processes
-    max_workers = 5
-    
-    # Timeout in seconds
-    timeout = 60
-    
-    print(f"Calculating cubes for {len(numbers)} numbers with max {max_workers} concurrent processes")
-    print(f"Each calculation will be killed if it takes more than {timeout} seconds")
-    print(f"Checking for timeouts every 10 seconds")
-    print(f"Note: Numbers divisible by 5 are set to take longer to demonstrate timeouts")
-    
-    # Set the start method to 'spawn' for better process isolation
-    multiprocessing.set_start_method('spawn', force=True)
-    
-    # Queue for results
+    # Create process queue and result queue
+    input_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
     
-    # Process tracking - list of dictionaries with process info
-    process_data = []
-    pending_numbers = list(numbers)
-    results = {}
-    
-    # Start timeout monitoring thread
-    monitor_thread = threading.Thread(
-        target=monitor_timeouts, 
-        args=(process_data, timeout, results),
-        daemon=True
-    )
-    monitor_thread.start()
-    
-    # Main processing loop
-    while pending_numbers or process_data:
-        # Start new processes if we have capacity
-        while len(process_data) < max_workers and pending_numbers:
-            number = pending_numbers.pop(0)
-            
-            # Create process
-            process = multiprocessing.Process(
-                target=process_number,
-                args=(number, result_queue)
-            )
-            process.start()
-            
-            # Store process data
-            process_data.append({
-                "process": process,
-                "number": number,
-                "pid": process.pid,
-                "start_time": time.time()
-            })
-            
-            print(f"Started process for number {number} with PID {process.pid}")
-        
-        # Check for completed results
-        while not result_queue.empty():
-            number, result = result_queue.get()
-            print(f"Result for number {number}: {result}")
-            results[number] = result
-        
-        # Check which processes are still running
-        for i in range(len(process_data) - 1, -1, -1):
-            if i < len(process_data) and not process_data[i]["process"].is_alive():
-                process_data.pop(i)
-        
-        # Small sleep to prevent CPU hogging
-        time.sleep(0.1)
-    
-    # Display all results
-    print("\nSummary of results:")
-    print("------------------")
-    for num in sorted(results.keys()):
-        print(f"Number {num}³ = {results[num]}")
-    
-    print("\nAll calculations completed")
+    # Fill the input queue
+    for num in numbers:
+        input_queue.put(num)
 
-if __name__ == "__main__":
-    main()
+    # Process tracking
+    active_processes = []
+    start_time = time.time()
+    last_check_time = time.time()
+
+    print(f"Starting cube calculations for {len(numbers)} numbers (max {MAX_CONCURRENT} concurrent)...")
+    print(f"Will check process status every {CHECK_INTERVAL} seconds\n")
+
+    while len(active_processes) > 0 or not input_queue.empty():
+        current_time = time.time()
+        
+        # Launch new processes if we have capacity and input remains
+        while len(active_processes) < MAX_CONCURRENT and not input_queue.empty():
+            num = input_queue.get()
+            p = multiprocessing.Process(
+                target=lambda q, n: q.put(cube(n)),
+                args=(result_queue, num)
+            )
+            p.start()
+            active_processes.append({
+                "process": p,
+                "number": num,
+                "pid": p.pid,
+                "start_time": current_time,
+                "last_checked": current_time
+            })
+            print(f"[{time.strftime('%H:%M:%S')}] Started process {p.pid} for {num}³")
+
+        # Only check processes at the specified interval
+        if current_time - last_check_time >= CHECK_INTERVAL:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Status check (running for {current_time - start_time:.1f}s)")
+            
+            for proc_info in active_processes[:]:  # Iterate over copy
+                p = proc_info["process"]
+                runtime = current_time - proc_info["start_time"]
+                
+                # Check for timeout
+                if runtime > TIMEOUT:
+                    print(f"⚠️ Timeout for {proc_info['number']}³ (PID: {proc_info['pid']}) after {TIMEOUT}s")
+                    p.terminate()
+                    active_processes.remove(proc_info)
+                    continue
+                
+                # Check if process finished
+                if not p.is_alive():
+                    try:
+                        while True:  # Get all available results
+                            num, result = result_queue.get_nowait()
+                            results.append((num, result))
+                            print(f"✓ Completed {num}³ = {result} (Ran for {time.time() - proc_info['start_time']:.1f}s)")
+                    except Empty:
+                        pass
+                    active_processes.remove(proc_info)
+                else:
+                    print(f"↻ {proc_info['number']}³ still running (PID: {proc_info['pid']}, {runtime:.1f}s elapsed)")
+            
+            last_check_time = current_time
+            print(f"Next check in {CHECK_INTERVAL} seconds...")
+        
+        # Sleep to prevent busy waiting (1s intervals between capacity checks)
+        time.sleep(1)
+
+    total_time = time.time() - start_time
+    print(f"\nAll calculations completed in {total_time:.2f} seconds")
+    
+    # Display results
+    print("\nFinal Results:")
+    for num, result in sorted(results, key=lambda x: x[0]):
+        print(f"{num}³ = {result}")
+
+    # Show any timed out or unprocessed numbers
+    processed_numbers = {num for num, _ in results}
+    if len(processed_numbers) < len(numbers):
+        print("\nIncomplete numbers:")
+        for num in numbers:
+            if num not in processed_numbers:
+                print(f"{num}³ (not completed)")
