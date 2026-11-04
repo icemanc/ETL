@@ -1,4 +1,3 @@
-# naga
 import multiprocessing
 import time
 from queue import Empty
